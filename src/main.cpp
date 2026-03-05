@@ -51,11 +51,11 @@ static const float RPM_PER_DUTY = 1.5f;
 static const float RPM_RAMP_RATE = 60.0f;        // rpm/s  (lên 60rpm ~1s)
 
 // 2) Feedforward giảm bớt để không "thừa ga"
-static const float FF_GAIN = 0.75f;              // 0.6~0.9
+static const float FF_GAIN = 0.55f;              // 0.6~0.9
 
 // 3) PI gains giảm lại để bớt vọt
 static float KP = 0.60f;                         // duty/rpm
-static float KI = 0.60f;                         // duty/(rpm*s)
+static float KI = 0.35f;                         // duty/(rpm*s)
 
 // 4) Chỉ tích phân khi gần target để tránh windup lúc ramp
 static const float I_ZONE_RPM = 8.0f;            // chỉ I khi |e| < 8 rpm
@@ -63,7 +63,7 @@ static const float I_ZONE_RPM = 8.0f;            // chỉ I khi |e| < 8 rpm
 // Anti-windup & stiction
 static const float I_LIMIT = 100.0f;
 static const int   MIN_DUTY = 20;
-static const float MIN_DUTY_ENABLE_RPM = 12.0f;  // chỉ ép MIN_DUTY khi |rpm_ref| >= 12 rpm
+static const float MIN_DUTY_ENABLE_RPM = 20.0f;  // chỉ ép MIN_DUTY khi |rpm_ref| >= 12 rpm
 
 // ===== Filter + Slew (chống giật) =====
 static const float TAU_RPM = 0.15f;              // tăng lọc nhẹ để mượt
