@@ -18,13 +18,13 @@ static const int PIN_SP1_2 = 25;
 static const int PIN_SP2_2 = 26;
 
 // ================== CONFIG ==================
-static const float MAX_RPM = 382.71f;
+static const float MAX_RPM = 380.0f; // max_rpm of DC motor
 
 // deadband command
 static const float RPM_DEADBAND = 1.0f;          // coi như stop
 static const float RPM_START_DEADBAND = 6.0f;    // < 6 rpm => ép về 0 (đỡ bò/trượt)
 
-// đảo chiều theo lắp cơ khí (giữ như bạn đang dùng)
+// đảo chiều theo lắp cơ khí 
 static const bool INVERT_DIR_1 = true;
 static const bool INVERT_DIR_2 = false;
 
@@ -39,31 +39,25 @@ static const int CH2 = 1;
 static const float TICKS_PER_REV = 1400.0f;
 
 // Timing
-static const uint32_t CTRL_DT_MS = 20;           // 50Hz
-static const uint32_t PUB_DT_MS  = 20;           // publish ticks 50Hz
+static const uint32_t CTRL_DT_MS = 20;           // chu ki chay PI controller
+static const uint32_t PUB_DT_MS  = 20;           // publish ticks 50Hz len bridge
 static const uint32_t CMD_TIMEOUT_MS = 500;
 
-// mapping đo được
-static const float RPM_PER_DUTY = 1.5f;
+// ===== Control design =====
+// Ramp setpoint
+static const float RPM_RAMP_RATE = 60.0f;        // rpm/s, thiet ke de toc do khong tang dot ngot
 
-// ===== Control design (NO OVERSHOOT VERSION) =====
-// 1) Ramp setpoint chậm hơn
-static const float RPM_RAMP_RATE = 60.0f;        // rpm/s  (lên 60rpm ~1s)
+// PI bù vào v_control, không bù trực tiếp vào duty
+static float KP = 0.15f;
+static float KI = 0.20f;
 
-// 2) Feedforward giảm bớt để không "thừa ga"
-static const float FF_GAIN = 0.55f;              // 0.6~0.9
-
-// 3) PI gains giảm lại để bớt vọt
-static float KP = 0.60f;                         // duty/rpm
-static float KI = 0.35f;                         // duty/(rpm*s)
-
-// 4) Chỉ tích phân khi gần target để tránh windup lúc ramp
-static const float I_ZONE_RPM = 8.0f;            // chỉ I khi |e| < 8 rpm
+// Chỉ tích phân khi gần target để tránh windup lúc ramp
+static const float I_ZONE_RPM = 8.0f;
 
 // Anti-windup & stiction
 static const float I_LIMIT = 100.0f;
 static const int   MIN_DUTY = 20;
-static const float MIN_DUTY_ENABLE_RPM = 20.0f;  // chỉ ép MIN_DUTY khi |rpm_ref| >= 12 rpm
+static const float MIN_DUTY_ENABLE_RPM = 12.0f;  // chỉ ép MIN_DUTY khi |rpm_ref| >= 12 rpm
 
 // ===== Filter + Slew (chống giật) =====
 static const float TAU_RPM = 0.15f;              // tăng lọc nhẹ để mượt
@@ -78,16 +72,17 @@ static float duty_prev_2 = 0.0f;
 static float rpm_ref_1 = 0.0f;
 static float rpm_ref_2 = 0.0f;
 
+
 // ================== ENCODER ==================
 ESP32Encoder enc1;
 ESP32Encoder enc2;
 
 // ================== STATE ==================
-static float rpm_cmd_1 = 0.0f, rpm_cmd_2 = 0.0f;
-static float rpm_fb_1  = 0.0f, rpm_fb_2  = 0.0f;
+static float rpm_cmd_1 = 0.0f, rpm_cmd_2 = 0.0f; // toc do lenh truc tiep tu bridge
+static float rpm_fb_1  = 0.0f, rpm_fb_2  = 0.0f; // toc do phan hoi tu encoder sau khi loc
 
-static float integ1 = 0.0f, integ2 = 0.0f;
-static float duty_out_1 = 0.0f, duty_out_2 = 0.0f;
+static float integ1 = 0.0f, integ2 = 0.0f;   // trang thai cua tich phan
+static float duty_out_1 = 0.0f, duty_out_2 = 0.0f; // duty dang xuat ra
 
 static uint32_t last_cmd_ms = 0;
 static uint32_t last_ctrl_ms = 0;
@@ -95,6 +90,10 @@ static uint32_t last_pub_ms  = 0;
 
 static int64_t prev_ticks_1 = 0;
 static int64_t prev_ticks_2 = 0;
+
+// ===== debug time values to publish =====
+// static float last_ctrl_dt_s = 0.0f;
+// static float last_pub_dt_s  = 0.0f;
 
 // ================== HELPERS ==================
 static inline float clampf(float x, float lo, float hi) {
@@ -151,7 +150,7 @@ static void applyDuty(float rpm_cmd, float duty_mag, int pinZF, int pinDR, int c
 
   int duty = (int)lroundf(clampf(duty_mag, 0.0f, (float)DUTY_MAX));
 
-  // chỉ ép MIN_DUTY khi đã thật sự muốn chạy nhanh (đỡ "thừa ga" lúc ramp nhỏ)
+  // chỉ ép MIN_DUTY khi đã thật sự muốn chạy nhanh
   if (fabsf(rpm_cmd) >= MIN_DUTY_ENABLE_RPM) {
     if (duty > 0 && duty < MIN_DUTY) duty = MIN_DUTY;
   }
@@ -160,8 +159,19 @@ static void applyDuty(float rpm_cmd, float duty_mag, int pinZF, int pinDR, int c
 }
 
 static inline void resetMotorState(int idx) {
-  if (idx == 1) { integ1 = 0; duty_out_1 = 0; rpm_f_1 = 0; duty_prev_1 = 0; rpm_ref_1 = 0; }
-  else         { integ2 = 0; duty_out_2 = 0; rpm_f_2 = 0; duty_prev_2 = 0; rpm_ref_2 = 0; }
+  if (idx == 1) {
+    integ1 = 0;
+    duty_out_1 = 0;
+    rpm_f_1 = 0;
+    duty_prev_1 = 0;
+    rpm_ref_1 = 0;
+  } else {
+    integ2 = 0;
+    duty_out_2 = 0;
+    rpm_f_2 = 0;
+    duty_prev_2 = 0;
+    rpm_ref_2 = 0;
+  }
 }
 
 // ================== SETUP ==================
@@ -216,7 +226,7 @@ void loop() {
       if (fabsf(rpm_cmd_1) < RPM_START_DEADBAND) rpm_cmd_1 = 0.0f;
       if (fabsf(rpm_cmd_2) < RPM_START_DEADBAND) rpm_cmd_2 = 0.0f;
 
-      if (fabsf(rpm_cmd_1) < RPM_DEADBAND) resetMotorState(1);
+      if (fabsf(rpm_cmd_1) < RPM_DEADBAND) resetMotorState(1);  // khi trang thai ve gan 0, reset bo dieu khien
       if (fabsf(rpm_cmd_2) < RPM_DEADBAND) resetMotorState(2);
     }
   }
@@ -233,12 +243,14 @@ void loop() {
   if (now - last_ctrl_ms >= CTRL_DT_MS) {
     float dt = (now - last_ctrl_ms) / 1000.0f;
     last_ctrl_ms = now;
+    //last_ctrl_dt_s = dt;   // lưu lại để publish
 
     // ramp setpoint
     rpm_ref_1 = ramp(rpm_ref_1, rpm_cmd_1, dt);
     rpm_ref_2 = ramp(rpm_ref_2, rpm_cmd_2, dt);
 
     // encoder -> rpm_raw
+    
     int64_t t1 = enc1.getCount();
     int64_t t2 = enc2.getCount();
     int64_t d1 = t1 - prev_ticks_1;
@@ -256,7 +268,7 @@ void loop() {
     rpm_fb_1 = rpm_f_1;
     rpm_fb_2 = rpm_f_2;
 
-    // PI theo độ lớn
+    // ===== GIỮ NGUYÊN CÁCH SO SÁNH THEO ĐỘ LỚN =====
     float vset1 = fabsf(rpm_ref_1);
     float vset2 = fabsf(rpm_ref_2);
     float vfb1  = fabsf(rpm_fb_1);
@@ -265,18 +277,23 @@ void loop() {
     float e1 = vset1 - vfb1;
     float e2 = vset2 - vfb2;
 
-    // feedforward giảm bớt
-    float duty_ff_1 = FF_GAIN * (vset1 / RPM_PER_DUTY);
-    float duty_ff_2 = FF_GAIN * (vset2 / RPM_PER_DUTY);
-
-    // I only near setpoint (anti-overshoot)
+    // chỉ tích phân khi gần target
     if (fabsf(e1) < I_ZONE_RPM) integ1 += KI * e1 * dt;
     if (fabsf(e2) < I_ZONE_RPM) integ2 += KI * e2 * dt;
+
     integ1 = clampf(integ1, -I_LIMIT, I_LIMIT);
     integ2 = clampf(integ2, -I_LIMIT, I_LIMIT);
 
-    duty_out_1 = duty_ff_1 + KP * e1 + integ1;
-    duty_out_2 = duty_ff_2 + KP * e2 + integ2;
+    // ===== PI BÙ VÀO V_CONTROL =====
+    float v_ctrl_1 = vset1 + KP * e1 + integ1;
+    float v_ctrl_2 = vset2 + KP * e2 + integ2;
+
+    v_ctrl_1 = clampf(v_ctrl_1, 0.0f, MAX_RPM);
+    v_ctrl_2 = clampf(v_ctrl_2, 0.0f, MAX_RPM);
+
+    // ===== ĐỔI V_CONTROL -> DUTY THEO TỈ LỆ v_control / v_max =====
+    duty_out_1 = (v_ctrl_1 / MAX_RPM) * DUTY_MAX;
+    duty_out_2 = (v_ctrl_2 / MAX_RPM) * DUTY_MAX;
 
     duty_out_1 = clampf(duty_out_1, 0.0f, (float)DUTY_MAX);
     duty_out_2 = clampf(duty_out_2, 0.0f, (float)DUTY_MAX);
@@ -285,17 +302,44 @@ void loop() {
     duty_out_1 = slew(duty_out_1, duty_prev_1);
     duty_out_2 = slew(duty_out_2, duty_prev_2);
 
-    // apply
-    applyDuty(rpm_ref_1, duty_out_1, PIN_ZF1, PIN_DR1, CH1, INVERT_DIR_1);
-    applyDuty(rpm_ref_2, duty_out_2, PIN_ZF2, PIN_DR2, CH2, INVERT_DIR_2);
+    // ===== DEBUG PRINT =====
+    Serial.print("dt ");
+    Serial.print(dt, 4);
+
+    Serial.print(" | v_set ");
+    Serial.print(vset1, 2);
+    Serial.print(" ");
+    Serial.print(vset2, 2);
+
+    Serial.print(" | v_fb ");
+    Serial.print(vfb1, 2);
+    Serial.print(" ");
+    Serial.print(vfb2, 2);
+
+    Serial.print(" | v_ctrl ");
+    Serial.print(v_ctrl_1, 2);
+    Serial.print(" ");
+    Serial.print(v_ctrl_2, 2);
+
+    Serial.print(" | duty ");
+    Serial.print(duty_out_1, 2);
+    Serial.print(" ");
+    Serial.println(duty_out_2, 2);
+
+// apply: vẫn dùng rpm_ref để quyết định chiều như code gốc
+applyDuty(rpm_ref_1, duty_out_1, PIN_ZF1, PIN_DR1, CH1, INVERT_DIR_1);
+applyDuty(rpm_ref_2, duty_out_2, PIN_ZF2, PIN_DR2, CH2, INVERT_DIR_2);
   }
 
+  // publish ticks + dt
   // publish ticks only
-  if (now - last_pub_ms >= PUB_DT_MS) {
-    last_pub_ms = now;
-    Serial.print("e ");
-    Serial.print((long)enc1.getCount());
-    Serial.print(" ");
-    Serial.println((long)enc2.getCount());
-  }
+if (now - last_pub_ms >= PUB_DT_MS) {
+  //last_pub_dt_s = (now - last_pub_ms) / 1000.0f;
+  last_pub_ms = now;
+
+  Serial.print("e ");
+  Serial.print((long)enc1.getCount());
+  Serial.print(" ");
+  Serial.println((long)enc2.getCount());
+}
 }
